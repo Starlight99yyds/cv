@@ -1,96 +1,87 @@
 import torch
 import torch.nn as nn
+from torch.nn.utils import spectral_norm
 
-
+# =========================
+# U-Net Generator
+# =========================
 class _netG(nn.Module):
     def __init__(self, opt):
-        super(_netG, self).__init__()
-        self.ngpu = opt.ngpu
-        self.main = nn.Sequential(
-            # input is (nc) x 128 x 128
-            nn.Conv2d(opt.nc,opt.nef,4,2,1, bias=False),
-            nn.LeakyReLU(0.2, inplace=True),
-            # state size: (nef) x 64 x 64
-            nn.Conv2d(opt.nef,opt.nef,4,2,1, bias=False),
-            nn.BatchNorm2d(opt.nef),
-            nn.LeakyReLU(0.2, inplace=True),
-            # state size: (nef) x 32 x 32
-            nn.Conv2d(opt.nef,opt.nef*2,4,2,1, bias=False),
-            nn.BatchNorm2d(opt.nef*2),
-            nn.LeakyReLU(0.2, inplace=True),
-            # state size: (nef*2) x 16 x 16
-            nn.Conv2d(opt.nef*2,opt.nef*4,4,2,1, bias=False),
-            nn.BatchNorm2d(opt.nef*4),
-            nn.LeakyReLU(0.2, inplace=True),
-            # state size: (nef*4) x 8 x 8
-            nn.Conv2d(opt.nef*4,opt.nef*8,4,2,1, bias=False),
-            nn.BatchNorm2d(opt.nef*8),
-            nn.LeakyReLU(0.2, inplace=True),
-            # state size: (nef*8) x 4 x 4
-            nn.Conv2d(opt.nef*8,opt.nBottleneck,4, bias=False),
-            # tate size: (nBottleneck) x 1 x 1
-            nn.BatchNorm2d(opt.nBottleneck),
-            nn.LeakyReLU(0.2, inplace=True),
-            # input is Bottleneck, going into a convolution
-            nn.ConvTranspose2d(opt.nBottleneck, opt.ngf * 8, 4, 1, 0, bias=False),
-            nn.BatchNorm2d(opt.ngf * 8),
+        super().__init__()
+        nf = opt.nef
+
+        def down(in_c, out_c):
+            return nn.Sequential(
+                nn.Conv2d(in_c, out_c, 4, 2, 1, bias=False),
+                nn.InstanceNorm2d(out_c),
+                nn.LeakyReLU(0.2, True)
+            )
+
+        def up(in_c, out_c):
+            return nn.Sequential(
+                nn.ConvTranspose2d(in_c, out_c, 4, 2, 1, bias=False),
+                nn.InstanceNorm2d(out_c),
+                nn.ReLU(True)
+            )
+
+        self.d1 = down(opt.nc, nf)
+        self.d2 = down(nf, nf*2)
+        self.d3 = down(nf*2, nf*4)
+        self.d4 = down(nf*4, nf*8)
+
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(nf*8, opt.nBottleneck, 4, 1, 0),
             nn.ReLU(True),
-            # state size. (ngf*8) x 4 x 4
-            nn.ConvTranspose2d(opt.ngf * 8, opt.ngf * 4, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(opt.ngf * 4),
-            nn.ReLU(True),
-            # state size. (ngf*4) x 8 x 8
-            nn.ConvTranspose2d(opt.ngf * 4, opt.ngf * 2, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(opt.ngf * 2),
-            nn.ReLU(True),
-            # state size. (ngf*2) x 16 x 16
-            nn.ConvTranspose2d(opt.ngf * 2, opt.ngf, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(opt.ngf),
-            nn.ReLU(True),
-            # state size. (ngf) x 32 x 32
-            nn.ConvTranspose2d(opt.ngf, opt.nc, 4, 2, 1, bias=False),
-            nn.Tanh()
-            # state size. (nc) x 64 x 64
+            nn.ConvTranspose2d(opt.nBottleneck, nf*8, 4, 1, 0),
+            nn.ReLU(True)
         )
 
-    def forward(self, input):
-        if isinstance(input.data, torch.cuda.FloatTensor) and self.ngpu > 1:
-            output = nn.parallel.data_parallel(self.main, input, range(self.ngpu))
-        else:
-            output = self.main(input)
-        return output
+        self.u4 = up(nf*16, nf*4)
+        self.u3 = up(nf*8, nf*2)
+        self.u2 = up(nf*4, nf)
+        self.u1 = nn.ConvTranspose2d(nf*2, opt.nc, 4, 2, 1)
+
+    def forward(self, x):
+        d1 = self.d1(x)
+        d2 = self.d2(d1)
+        d3 = self.d3(d2)
+        d4 = self.d4(d3)
+
+        b = self.bottleneck(d4)
+
+        u4 = self.u4(torch.cat([b, d4], 1))
+        u3 = self.u3(torch.cat([u4, d3], 1))
+        u2 = self.u2(torch.cat([u3, d2], 1))
+        out = torch.tanh(self.u1(torch.cat([u2, d1], 1)))
+        return out
 
 
+# =========================
+# PatchGAN Discriminator
+# =========================
 class _netlocalD(nn.Module):
     def __init__(self, opt):
-        super(_netlocalD, self).__init__()
-        self.ngpu = opt.ngpu
+        super().__init__()
+        nf = opt.ndf
+
         self.main = nn.Sequential(
-            # input is (nc) x 64 x 64
-            nn.Conv2d(opt.nc, opt.ndf, 4, 2, 1, bias=False),
-            nn.LeakyReLU(0.2, inplace=True),
-            # state size. (ndf) x 32 x 32
-            nn.Conv2d(opt.ndf, opt.ndf * 2, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(opt.ndf * 2),
-            nn.LeakyReLU(0.2, inplace=True),
-            # state size. (ndf*2) x 16 x 16
-            nn.Conv2d(opt.ndf * 2, opt.ndf * 4, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(opt.ndf * 4),
-            nn.LeakyReLU(0.2, inplace=True),
-            # state size. (ndf*4) x 8 x 8
-            nn.Conv2d(opt.ndf * 4, opt.ndf * 8, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(opt.ndf * 8),
-            nn.LeakyReLU(0.2, inplace=True),
-            # state size. (ndf*8) x 4 x 4
-            #nn.Conv2d(opt.ndf * 8, 1, 4, 1, 0, bias=False),
-            nn.Sigmoid()
+            spectral_norm(nn.Conv2d(opt.nc, nf, 4, 2, 1)),
+            nn.LeakyReLU(0.2, True),
+
+            spectral_norm(nn.Conv2d(nf, nf*2, 4, 2, 1)),
+            nn.InstanceNorm2d(nf*2),
+            nn.LeakyReLU(0.2, True),
+
+            spectral_norm(nn.Conv2d(nf*2, nf*4, 4, 2, 1)),
+            nn.InstanceNorm2d(nf*4),
+            nn.LeakyReLU(0.2, True),
+
+            spectral_norm(nn.Conv2d(nf*4, nf*8, 4, 1, 1)),
+            nn.InstanceNorm2d(nf*8),
+            nn.LeakyReLU(0.2, True),
+
+            nn.Conv2d(nf*8, 1, 3, 1, 1)
         )
 
-    def forward(self, input):
-        if isinstance(input.data, torch.cuda.FloatTensor) and self.ngpu > 1:
-            output = nn.parallel.data_parallel(self.main, input, range(self.ngpu))
-        else:
-            output = self.main(input)
-
-        return output.view(-1, 1)
-
+    def forward(self, x):
+        return self.main(x)
