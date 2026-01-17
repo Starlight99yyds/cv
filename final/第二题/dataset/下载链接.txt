@@ -1,1 +1,1 @@
-https://aistudio.baidu.com/datasetdetail/122247
+https://gitee.com/yydsyyd531327/paris-street-view-dataset
